@@ -65,6 +65,17 @@ void reset_insert_info(){
 	server.total_time = 0;
 }
 
+/*check partitionInfo column*/
+int _isPartition_Column(Vector *v, int column){
+
+	for (size_t l = 0; l < vectorCount(v); ++l){
+		PartitionParameter *param = (PartitionParameter *) vectorGet(v, l);
+		if(param->columnId == column){
+			return true;
+		}
+	}
+	return false;
+}
 
 void fpWriteCommand(client *c){
 
@@ -75,17 +86,25 @@ void fpWriteCommand(client *c){
     int i;
     long long insertedRow = 0;
     int Enroll_queue = 0;
-    //long long meta_start = 0;
-    //long long insert_start = 0;
 
     //struct redisClient *fakeClient = NULL;
 
     serverLog(LL_DEBUG, "fpWrite Param List ==> Key : %s, partition : %s, num_of_column : %s, indexColumn : %s",
             (char *) c->argv[1]->ptr,(char *) c->argv[2]->ptr, (char *) c->argv[3]->ptr , (char *) c->argv[4]->ptr);
 
-    //meta_start = ustime();
     /*parsing dataInfo*/
     NewDataKeyInfo *dataKeyInfo = parsingDataKeyInfo((sds)c->argv[1]->ptr);
+
+    //parsing partitionInfo detail
+    Vector partitions;
+    vectorInit(&partitions);
+
+    if (parsePartitions(dataKeyInfo->partitionInfo.partitionString,
+                        &partitions) == C_ERR) {
+        _freePartitionParameters(&partitions);
+        addReplyError(c, "parsePartitions Error");
+        return;
+    }
 
     /*get column number*/
     int column_number = atoi((char *) c->argv[3]->ptr);
@@ -102,6 +121,7 @@ void fpWriteCommand(client *c){
     	addReplyError(c, "column_number Error");
     	return;
     }
+
     long long time1 = GetTimeDiff(1);
     server.parsing_time += time1;
     //serverLog(LL_WARNING, "Parsing END TIME %lld", time1); //parsing time
@@ -164,56 +184,62 @@ void fpWriteCommand(client *c){
 					dataKeyString->ptr);
 			row_number = 0;
 		}
-//		server.stat_time_meta_update += ustime() - meta_start;
 
-		//insert_start = ustime();
-		    long long time3 = GetTimeDiff(1);
-		    server.tiering_time += time3;
-		    //serverLog(LL_WARNING, "Tiering END TIME %lld", time3); //Meta lookup time
+		long long time3 = GetTimeDiff(1);
+		server.tiering_time += time3;
+		//serverLog(LL_WARNING, "Tiering END TIME %lld", time3); //Meta lookup time
+		GetTimeDiff(0);
 
-		    GetTimeDiff(0);
+		/*create Field and insert Data*/
+		if(row_number < 0 || row_number > server.rowgroup_size)
+			serverAssert(0);
 
     int idx =0;
     int init =0;
     for(i = 5; i < c->argc; i++){
 
-    	   /*TODO - pk column check & ROW MAX LIMIT, COLUMN MAX LIMIT, */
-
-    	robj *valueObj = getDecodedObject(c->argv[i]);
-
-    	//Create field Info
-    	if(row_number < 0 || row_number > server.rowgroup_size)
-    		serverAssert(0);
-    	int row_idx = row_number + (idx / column_number) + 1;
     	int column_idx = (idx % column_number) + 1;
-    	int columnvector_idx = ((row_idx -1) / server.columnvector_size + 1);
-     assert(column_idx <= MAX_COLUMN_NUMBER);
+    	assert(column_idx <= MAX_COLUMN_NUMBER);
 
-    	robj *dataField = getDataField(columnvector_idx, column_idx);
-     serverLog(LL_DEBUG, "DATAFIELD KEY = %s", (char *)dataField->ptr);
-     assert(dataField != NULL);
+    	if(!(_isPartition_Column(&partitions,column_idx))){ //not partition column
 
+    		int row_idx = row_number + (idx / column_number) + 1;
+    		int columnvector_idx = ((row_idx -1) / server.columnvector_size + 1);
 
-     /*check Value Type*/
-     if(!(strcmp((char *)valueObj->ptr, NULLVALUE)))
-        	valueObj = shared.nullValue;
+    		//Create Field Info
+    		robj *dataField = getDataField(columnvector_idx, column_idx);
+    		serverLog(LL_DEBUG, "DATAFIELD KEY = %s", (char *)dataField->ptr);
+    		assert(dataField != NULL);
 
+    		//Decoding value object
+    		robj *valueObj = getDecodedObject(c->argv[i]);
 
-     serverLog(LL_DEBUG, "insertKVpairToRelational key : %s, field : %s, value : %s",
-        		(char *)dataKeyString->ptr, (char *)dataField->ptr, (char *)valueObj->ptr);
+    		/*Check Value Type*/
+    		if(!(strcmp((char *)valueObj->ptr, NULLVALUE)))
+    			valueObj = shared.nullValue;
 
-     /*insert data into dict with Relational model*/
-     init = insertKVpairToRelational(c, dataKeyString, dataField, valueObj);
+    		serverLog(LL_DEBUG, "insertKVpairToRelational key : %s, field : %s, value : %s",
+    				(char *)dataKeyString->ptr, (char *)dataField->ptr, (char *)valueObj->ptr);
 
-     if(init)
-    	 Enroll_queue++;
+    		/*insert data into dict with Relational model*/
+    		init = insertKVpairToRelational(c, dataKeyString, dataField, valueObj);
 
-     idx++;
-     insertedRow++;
-     decrRefCount(dataField);
-     decrRefCount(valueObj);
+    		if(init)
+    			Enroll_queue++;
+
+    		idx++;
+    		insertedRow++;
+    		decrRefCount(dataField);
+    		decrRefCount(valueObj);
+
+    	} else {  /*partition column*/
+    		serverLog(LL_DEBUG, "%d is partition column", column_idx);
+    		idx++;
+    		insertedRow++;
+    		continue;
+
+    	}
     }
-    //server.stat_time_data_insert += ustime() - insert_start;
 
     /*addb update row number info*/
     insertedRow /= column_number;
@@ -237,6 +263,7 @@ void fpWriteCommand(client *c){
     }
 
     decrRefCount(dataKeyString);
+    _freePartitionParameters(&partitions);
     zfree(dataKeyInfo);
     addReply(c, shared.ok);
 }
